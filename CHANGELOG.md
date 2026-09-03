@@ -1,5 +1,11 @@
 # Changelog
 
+## 0.3.3
+
+- Исправлена проверка владельца SUID-файлов на merged-`/usr` Debian/Ubuntu: учитываются эквивалентные пути `/bin` ↔ `/usr/bin`, `/sbin` ↔ `/usr/sbin`, `/lib` ↔ `/usr/lib` и `/lib64` ↔ `/usr/lib64` только когда соответствующий top-level каталог действительно является merged-`/usr` symlink.
+- Детальный блок `Docker host-published ports` теперь выводит только mappings с `->` и не показывает рядом container-only `EXPOSE` записи того же контейнера.
+- Устранён ложный SUID WARN для штатных файлов наподобие `fusermount3`, когда dpkg хранит исторический `/bin/...` путь, а filesystem scan возвращает `/usr/bin/...`.
+
 ## 0.3.2
 
 - TCP listeners и UDP bound sockets теперь считаются и оцениваются раздельно.

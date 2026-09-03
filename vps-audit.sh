@@ -5,7 +5,7 @@
 # Read-only by design: it does not modify SSH, firewall, Fail2Ban, packages,
 # systemd units, or application configuration. It only creates a local report.
 
-VPS_AUDIT_VERSION="0.3.2"
+VPS_AUDIT_VERSION="0.3.3"
 
 # Force stable command output where possible. This avoids parsing failures on
 # non-English systems.
@@ -79,6 +79,62 @@ safe_count() {
     local value="${1:-0}"
     value=$(printf '%s' "$value" | tr -cd '0-9')
     printf '%s' "${value:-0}"
+}
+
+# Check whether dpkg owns a path, including the historical aliases retained on
+# merged-/usr Debian/Ubuntu systems. For example, dpkg may record
+# /bin/fusermount3 while the filesystem scan returns /usr/bin/fusermount3.
+dpkg_path_is_owned() {
+    local path="$1" real_path="" alias_path="" merged_target=""
+
+    command_exists dpkg-query || return 1
+
+    if dpkg-query -S "$path" >/dev/null 2>&1; then
+        return 0
+    fi
+
+    real_path=$(readlink -f -- "$path" 2>/dev/null || true)
+    if [ -n "$real_path" ] && [ "$real_path" != "$path" ] && \
+       dpkg-query -S "$real_path" >/dev/null 2>&1; then
+        return 0
+    fi
+
+    case "$path" in
+        /usr/bin/*)
+            merged_target=$(readlink -f /bin 2>/dev/null || true)
+            [ "$merged_target" = "/usr/bin" ] && alias_path="/bin/${path#/usr/bin/}"
+            ;;
+        /usr/sbin/*)
+            merged_target=$(readlink -f /sbin 2>/dev/null || true)
+            [ "$merged_target" = "/usr/sbin" ] && alias_path="/sbin/${path#/usr/sbin/}"
+            ;;
+        /usr/lib64/*)
+            merged_target=$(readlink -f /lib64 2>/dev/null || true)
+            [ "$merged_target" = "/usr/lib64" ] && alias_path="/lib64/${path#/usr/lib64/}"
+            ;;
+        /usr/lib/*)
+            merged_target=$(readlink -f /lib 2>/dev/null || true)
+            [ "$merged_target" = "/usr/lib" ] && alias_path="/lib/${path#/usr/lib/}"
+            ;;
+        /bin/*)
+            merged_target=$(readlink -f /bin 2>/dev/null || true)
+            [ "$merged_target" = "/usr/bin" ] && alias_path="/usr/bin/${path#/bin/}"
+            ;;
+        /sbin/*)
+            merged_target=$(readlink -f /sbin 2>/dev/null || true)
+            [ "$merged_target" = "/usr/sbin" ] && alias_path="/usr/sbin/${path#/sbin/}"
+            ;;
+        /lib64/*)
+            merged_target=$(readlink -f /lib64 2>/dev/null || true)
+            [ "$merged_target" = "/usr/lib64" ] && alias_path="/usr/lib64/${path#/lib64/}"
+            ;;
+        /lib/*)
+            merged_target=$(readlink -f /lib 2>/dev/null || true)
+            [ "$merged_target" = "/usr/lib" ] && alias_path="/usr/lib/${path#/lib/}"
+            ;;
+    esac
+
+    [ -n "$alias_path" ] && dpkg-query -S "$alias_path" >/dev/null 2>&1
 }
 
 translate_header() {
@@ -900,7 +956,23 @@ fi
 # are actual host publications and should be treated as host attack surface.
 if command_exists docker && command_exists systemctl && systemctl is-active --quiet docker 2>/dev/null; then
     DOCKER_PORT_ROWS=$(docker ps --format '{{.Names}}\t{{.Ports}}' 2>/dev/null | awk -F'\t' '$2 != "" {print}' || true)
-    DOCKER_PUBLISHED=$(printf '%s\n' "$DOCKER_PORT_ROWS" | awk -F'\t' '$2 ~ /->/ {print}' || true)
+    # Keep only comma-separated port entries that contain an actual host mapping.
+    # This prevents container-only EXPOSE metadata from leaking into the detailed
+    # "host-published" report block when the same container also has one mapping.
+    DOCKER_PUBLISHED=$(printf '%s\n' "$DOCKER_PORT_ROWS" | awk -F'\t' '
+        {
+            count = split($2, ports, /,[[:space:]]*/)
+            published = ""
+            for (i = 1; i <= count; i++) {
+                if (ports[i] ~ /->/) {
+                    published = published (published == "" ? "" : ", ") ports[i]
+                }
+            }
+            if (published != "") {
+                print $1 "\t" published
+            }
+        }
+    ' || true)
 
     if [ -n "$DOCKER_PUBLISHED" ]; then
         append_report_block "Docker host-published ports" "$DOCKER_PUBLISHED"
@@ -1005,9 +1077,7 @@ if command_exists find; then
 
     if command_exists dpkg-query; then
         for suid_file in "${SUID_FILES[@]}"; do
-            suid_real=$(readlink -f "$suid_file" 2>/dev/null || printf '%s' "$suid_file")
-            if ! dpkg-query -S "$suid_file" >/dev/null 2>&1 && \
-               ! dpkg-query -S "$suid_real" >/dev/null 2>&1; then
+            if ! dpkg_path_is_owned "$suid_file"; then
                 SUID_UNOWNED+=("$suid_file")
             fi
         done
