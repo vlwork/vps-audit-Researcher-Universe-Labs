@@ -1,5 +1,15 @@
 # Changelog
 
+## 0.3.2
+
+- TCP listeners и UDP bound sockets теперь считаются и оцениваются раздельно.
+- Последовательные порты в детальном network-отчёте сворачиваются в диапазоны, например `50000-50100/udp`.
+- Docker `EXPOSE` больше не считается host publication: учитываются только mappings с `->`.
+- Добавлена проверка wildcard Docker publications и состояния `DOCKER-USER` при активном UFW.
+- SUID scan исключает common Docker/containerd/containers/LXC/Snap image stores и учитывает canonical path через `readlink -f`.
+- Уменьшены ложные WARN для серверов с WebRTC, VPN и контейнерными образами.
+- README обновлён для публичного репозитория `vlwork/vps-audit-Researcher-Universe-Labs`.
+
 ## 0.3.1
 
 - Добавлен двуязычный English/Russian вывод.

@@ -1,10 +1,10 @@
-# VPS Audit RU
+# VPS Audit — Researcher Universe Labs
 
 Улучшенный двуязычный Bash-скрипт для **аудита безопасности и состояния Debian/Ubuntu VPS**.
 
 Проект основан на [`nuver-labs/vps-audit`](https://github.com/nuver-labs/vps-audit) и распространяется на условиях MIT License.
 
-Текущая версия: **0.3.1**.
+Текущая версия: **0.3.2**.
 
 ## Основные возможности
 
@@ -13,16 +13,18 @@
 - эффективная конфигурация SSH через `sshd -T`;
 - проверка `PermitRootLogin`, парольной и ключевой аутентификации;
 - проверка UFW, firewalld, nftables и iptables;
-- анализ TCP/UDP listeners с разделением loopback и сетевых bind-адресов;
+- раздельный анализ TCP listeners и UDP bound sockets с разделением loopback и сетевых bind-адресов;
+- сворачивание последовательных UDP/TCP-портов в диапазоны в детальном отчёте;
 - проверка Fail2Ban, CrowdSec и SSHGuard;
 - проверка соответствия порта SSH jail'у Fail2Ban;
 - проверка unattended-upgrades и `apt-daily-upgrade.timer`;
 - раздельная оценка обычных и security-обновлений;
 - анализ failed SSH logins за единое окно времени;
 - поддержка `/etc/sudoers.d/` и sudo-rs;
-- безопасный SUID scan в пределах корневой файловой системы (`find / -xdev`);
+- безопасный SUID scan в пределах корневой файловой системы (`find / -xdev`) с исключением хранилищ Docker/containerd/Snap, чтобы не считать файлы образов host-SUID файлами;
 - health-показатели CPU, RAM и диска отдельно от security-оценки;
-- обзор опубликованных Docker-портов;
+- анализ только реально опубликованных Docker host-портов (`->`), без смешивания с container-only `EXPOSE`;
+- проверка `DOCKER-USER` при wildcard-публикациях и активном UFW;
 - локальный отчёт с правами `0600`.
 
 ## Требования
@@ -37,10 +39,8 @@
 
 ## Установка
 
-После публикации репозитория:
-
 ```bash
-curl -fsSLO https://raw.githubusercontent.com/vlwork/vps-audit-ru/main/vps-audit.sh
+curl -fsSLO https://raw.githubusercontent.com/vlwork/vps-audit-Researcher-Universe-Labs/main/vps-audit.sh
 chmod +x vps-audit.sh
 sudo ./vps-audit.sh
 ```
@@ -48,7 +48,7 @@ sudo ./vps-audit.sh
 Или через `wget`:
 
 ```bash
-wget https://raw.githubusercontent.com/vlwork/vps-audit-ru/main/vps-audit.sh
+wget https://raw.githubusercontent.com/vlwork/vps-audit-Researcher-Universe-Labs/main/vps-audit.sh
 chmod +x vps-audit.sh
 sudo ./vps-audit.sh
 ```
@@ -120,14 +120,15 @@ ENABLE_PUBLIC_IP_LOOKUP=false
 По сравнению с исходным `nuver-labs/vps-audit` эта версия, среди прочего:
 
 - не считает каждый listening socket публичным портом;
-- учитывает UDP listeners;
+- разделяет TCP listeners и UDP bound sockets, чтобы большие WebRTC/VPN UDP-диапазоны не раздували TCP attack surface;
 - не принимает простое наличие `Chain INPUT` в iptables за доказательство работающего firewall;
 - не называет все доступные APT-обновления security updates;
 - проверяет не только наличие `unattended-upgrades`, но и конфигурацию/таймер;
 - использует effective SSH config;
 - корректнее классифицирует `PermitRootLogin prohibit-password`;
 - поддерживает `sudoers.d` и sudo-rs;
-- не сканирует рекурсивно отдельные смонтированные файловые системы при SUID-проверке;
+- не сканирует рекурсивно отдельные смонтированные файловые системы и common container/image stores при SUID-проверке;
+- отличает Docker host publications от внутренних container-only портов и отдельно предупреждает о wildcard-публикациях;
 - отделяет health metrics от security findings;
 - содержит русские пояснения рядом с английскими результатами.
 
@@ -135,6 +136,7 @@ ENABLE_PUBLIC_IP_LOOKUP=false
 
 - Основная цель — Debian/Ubuntu.
 - Скрипт выполняет локальный аудит, а не внешний network scan. Listener на `0.0.0.0` ещё не означает, что порт реально достижим из Интернета: доступ может ограничивать firewall VPS-провайдера, NAT или upstream ACL.
+- Для Docker скрипт отдельно показывает host-published ports. При классическом iptables backend активный UFW сам по себе не доказывает, что wildcard Docker publication ограничена; при наличии `DOCKER-USER` проверяется наличие пользовательских правил.
 - Результаты являются вспомогательным аудитом и не заменяют ручной security review.
 
 ## Проверка синтаксиса

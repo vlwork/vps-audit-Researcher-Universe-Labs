@@ -5,7 +5,7 @@
 # Read-only by design: it does not modify SSH, firewall, Fail2Ban, packages,
 # systemd units, or application configuration. It only creates a local report.
 
-VPS_AUDIT_VERSION="0.3.1"
+VPS_AUDIT_VERSION="0.3.2"
 
 # Force stable command output where possible. This avoids parsing failures on
 # non-English systems.
@@ -124,8 +124,13 @@ translate_test() {
         "Fail2Ban SSH Port Alignment") printf '%s' "Соответствие SSH-порта в Fail2Ban" ;;
         "Failed SSH Logins") printf '%s' "Неудачные входы по SSH" ;;
         "Listening Sockets") printf '%s' "Прослушиваемые сокеты" ;;
+        "TCP Listening Sockets") printf '%s' "Прослушиваемые TCP-сокеты" ;;
+        "TCP Wildcard Listeners") printf '%s' "TCP-сокеты на всех адресах" ;;
+        "UDP Bound Sockets") printf '%s' "Привязанные UDP-сокеты" ;;
+        "UDP Wildcard Sockets") printf '%s' "UDP-сокеты на всех адресах" ;;
         "Wildcard Listeners") printf '%s' "Сокеты на всех адресах" ;;
         "Docker Port Publishing") printf '%s' "Публикация портов Docker" ;;
+        "Docker Firewall Integration") printf '%s' "Интеграция Docker с firewall" ;;
         "Sudo Logging") printf '%s' "Журналирование sudo" ;;
         "Password Policy") printf '%s' "Политика паролей" ;;
         "SUID Files") printf '%s' "SUID-файлы" ;;
@@ -155,7 +160,12 @@ translate_block_title() {
         "Fail2Ban active jail list") printf '%s' "Список активных jail Fail2Ban" ;;
         "Network-bound listeners") printf '%s' "Сокеты, доступные через сетевые интерфейсы" ;;
         "Loopback-only listeners") printf '%s' "Сокеты только на loopback" ;;
+        "Network-bound TCP listeners") printf '%s' "TCP-сокеты, привязанные к сетевым интерфейсам" ;;
+        "Loopback-only TCP listeners") printf '%s' "TCP-сокеты только на loopback" ;;
+        "Network-bound UDP sockets") printf '%s' "UDP-сокеты, привязанные к сетевым интерфейсам" ;;
+        "Loopback-only UDP sockets") printf '%s' "UDP-сокеты только на loopback" ;;
         "Docker published ports") printf '%s' "Опубликованные порты Docker" ;;
+        "Docker host-published ports") printf '%s' "Порты Docker, опубликованные на хосте" ;;
         "SUID files on root filesystem") printf '%s' "SUID-файлы в корневой файловой системе" ;;
         "SUID files not owned by a Debian package") printf '%s' "SUID-файлы, не принадлежащие пакетам Debian" ;;
         "Failed systemd services") printf '%s' "Службы systemd с ошибками" ;;
@@ -277,6 +287,56 @@ is_wildcard_address() {
         0.0.0.0|::|\*) return 0 ;;
         *) return 1 ;;
     esac
+}
+
+# Summarize numeric endpoint lists by address and collapse consecutive ports.
+# Example: udp/50000..udp/50100 @ 0.0.0.0 becomes udp/50000-50100 @ 0.0.0.0.
+summarize_endpoint_ranges() {
+    local proto="$1"
+    shift
+    [ "$#" -gt 0 ] || return 0
+
+    printf '%s\n' "$@" \
+        | awk -v wanted="$proto" '
+            {
+                split($1, pp, "/")
+                if (pp[1] == wanted && pp[2] ~ /^[0-9]+$/ && $2 == "@") {
+                    print $3 "\t" pp[2]
+                }
+            }
+        ' \
+        | sort -t $'\t' -k1,1 -k2,2n -u \
+        | awk -F '\t' -v proto="$proto" '
+            function emit(addr, start, last,    range) {
+                if (addr == "") return
+                range = (start == last ? start : start "-" last)
+                if (out[addr] == "") out[addr] = range
+                else out[addr] = out[addr] "," range
+            }
+            {
+                addr=$1
+                port=$2+0
+                if (addr != current_addr) {
+                    if (current_addr != "") emit(current_addr, start, last)
+                    current_addr=addr
+                    start=port
+                    last=port
+                    next
+                }
+                if (port == last + 1) {
+                    last=port
+                } else if (port != last) {
+                    emit(current_addr, start, last)
+                    start=port
+                    last=port
+                }
+            }
+            END {
+                if (current_addr != "") emit(current_addr, start, last)
+                for (addr in out) print proto "/" out[addr] " @ " addr
+            }
+        ' \
+        | sort
 }
 
 read_sshd_value() {
@@ -496,11 +556,13 @@ fi
 
 # Firewall detection. Do not equate an installed binary with protection.
 FIREWALL_ACTIVE=0
+UFW_ACTIVE=0
 FIREWALL_DETAILS=()
 
 if command_exists ufw; then
     UFW_STATUS=$(ufw status 2>/dev/null | head -1 || true)
     if printf '%s' "$UFW_STATUS" | grep -q 'Status: active'; then
+        UFW_ACTIVE=1
         FIREWALL_ACTIVE=1
         FIREWALL_DETAILS+=("UFW active")
     else
@@ -744,13 +806,18 @@ if [ -n "$FAILED_LOGIN_SCOPE" ]; then
     fi
 fi
 
-# Listening sockets: distinguish loopback from network-bound sockets. We do not
-# call these "Internet exposed" because host/provider firewalls and NAT matter.
+# Listening sockets: inventory TCP listeners separately from UDP bound sockets.
+# Large UDP ranges (for example WebRTC media ports) should not inflate the TCP
+# attack-surface count or be presented as hundreds of independent services.
 if command_exists ss; then
-    SS_LISTEN=$(ss -H -lntu 2>/dev/null || true)
-    LOOPBACK_ENDPOINTS=()
-    NETWORK_ENDPOINTS=()
-    WILDCARD_ENDPOINTS=()
+    SS_SOCKETS=$(ss -H -lntu 2>/dev/null || true)
+
+    TCP_LOOPBACK_ENDPOINTS=()
+    TCP_NETWORK_ENDPOINTS=()
+    TCP_WILDCARD_ENDPOINTS=()
+    UDP_LOOPBACK_ENDPOINTS=()
+    UDP_NETWORK_ENDPOINTS=()
+    UDP_WILDCARD_ENDPOINTS=()
 
     while read -r proto state recvq sendq local peer rest; do
         [ -n "${local:-}" ] || continue
@@ -758,54 +825,122 @@ if command_exists ss; then
         port=$(endpoint_port "$local")
         endpoint="${proto}/${port} @ ${addr}"
 
-        if is_loopback_address "$addr"; then
-            LOOPBACK_ENDPOINTS+=("$endpoint")
-        elif is_wildcard_address "$addr"; then
-            WILDCARD_ENDPOINTS+=("$endpoint")
-            NETWORK_ENDPOINTS+=("$endpoint")
+        case "$proto" in
+            tcp)
+                if is_loopback_address "$addr"; then
+                    TCP_LOOPBACK_ENDPOINTS+=("$endpoint")
+                elif is_wildcard_address "$addr"; then
+                    TCP_WILDCARD_ENDPOINTS+=("$endpoint")
+                    TCP_NETWORK_ENDPOINTS+=("$endpoint")
+                else
+                    TCP_NETWORK_ENDPOINTS+=("$endpoint")
+                fi
+                ;;
+            udp)
+                if is_loopback_address "$addr"; then
+                    UDP_LOOPBACK_ENDPOINTS+=("$endpoint")
+                elif is_wildcard_address "$addr"; then
+                    UDP_WILDCARD_ENDPOINTS+=("$endpoint")
+                    UDP_NETWORK_ENDPOINTS+=("$endpoint")
+                else
+                    UDP_NETWORK_ENDPOINTS+=("$endpoint")
+                fi
+                ;;
+        esac
+    done <<< "$SS_SOCKETS"
+
+    TCP_LOOPBACK_COUNT=${#TCP_LOOPBACK_ENDPOINTS[@]}
+    TCP_NETWORK_COUNT=${#TCP_NETWORK_ENDPOINTS[@]}
+    TCP_WILDCARD_COUNT=${#TCP_WILDCARD_ENDPOINTS[@]}
+    UDP_LOOPBACK_COUNT=${#UDP_LOOPBACK_ENDPOINTS[@]}
+    UDP_NETWORK_COUNT=${#UDP_NETWORK_ENDPOINTS[@]}
+    UDP_WILDCARD_COUNT=${#UDP_WILDCARD_ENDPOINTS[@]}
+
+    report_result "TCP Listening Sockets" "INFO" "$TCP_NETWORK_COUNT network-bound TCP listener(s), including $TCP_WILDCARD_COUNT wildcard listener(s), plus $TCP_LOOPBACK_COUNT loopback-only listener(s)." "TCP listeners на сетевых интерфейсах: $TCP_NETWORK_COUNT, из них на всех адресах: $TCP_WILDCARD_COUNT; только loopback: $TCP_LOOPBACK_COUNT."
+
+    if [ "$TCP_NETWORK_COUNT" -gt 0 ]; then
+        append_report_block "Network-bound TCP listeners" "$(summarize_endpoint_ranges tcp "${TCP_NETWORK_ENDPOINTS[@]}")"
+    fi
+    if [ "$TCP_LOOPBACK_COUNT" -gt 0 ]; then
+        append_report_block "Loopback-only TCP listeners" "$(summarize_endpoint_ranges tcp "${TCP_LOOPBACK_ENDPOINTS[@]}")"
+    fi
+
+    if [ "$TCP_WILDCARD_COUNT" -gt 0 ]; then
+        if [ "${FIREWALL_ACTIVE:-0}" -eq 1 ]; then
+            report_result "TCP Wildcard Listeners" "INFO" "$TCP_WILDCARD_COUNT TCP listener(s) bind to all local addresses. An active/restrictive firewall was detected; verify intended allowed ports rather than treating wildcard bind as exposure by itself." "$TCP_WILDCARD_COUNT TCP listener(s) привязаны ко всем локальным адресам. Обнаружен активный/ограничивающий firewall; проверьте разрешённые порты, не считая wildcard-привязку сама по себе внешней доступностью."
         else
-            NETWORK_ENDPOINTS+=("$endpoint")
+            report_result "TCP Wildcard Listeners" "WARN" "$TCP_WILDCARD_COUNT TCP listener(s) bind to all local addresses and no restrictive firewall was confirmed." "$TCP_WILDCARD_COUNT TCP listener(s) привязаны ко всем локальным адресам, при этом ограничивающий firewall не подтверждён."
         fi
-    done <<< "$SS_LISTEN"
-
-    LOOPBACK_COUNT=${#LOOPBACK_ENDPOINTS[@]}
-    NETWORK_COUNT=${#NETWORK_ENDPOINTS[@]}
-    WILDCARD_COUNT=${#WILDCARD_ENDPOINTS[@]}
-
-    report_result "Listening Sockets" "INFO" "$NETWORK_COUNT network-bound listener(s), including $WILDCARD_COUNT wildcard listener(s), plus $LOOPBACK_COUNT loopback-only listener(s). Network-bound does not automatically mean Internet-accessible." "Сетевых listeners: $NETWORK_COUNT, из них на всех адресах: $WILDCARD_COUNT; только loopback: $LOOPBACK_COUNT. Привязка к сетевому интерфейсу не означает автоматическую доступность из Интернета."
-
-    if [ "$NETWORK_COUNT" -gt 0 ]; then
-        printf '\nNetwork-bound listeners (Сокеты, доступные через сетевые интерфейсы)\n--------------------------------\n' >> "$REPORT_FILE"
-        printf '%s\n' "${NETWORK_ENDPOINTS[@]}" | sort -u >> "$REPORT_FILE"
-    fi
-    if [ "$LOOPBACK_COUNT" -gt 0 ]; then
-        printf '\nLoopback-only listeners (Сокеты только на loopback)\n--------------------------------\n' >> "$REPORT_FILE"
-        printf '%s\n' "${LOOPBACK_ENDPOINTS[@]}" | sort -u >> "$REPORT_FILE"
-    fi
-
-    if [ "$WILDCARD_COUNT" -gt 0 ]; then
-        report_result "Wildcard Listeners" "WARN" "$WILDCARD_COUNT listener(s) bind to all local addresses (0.0.0.0/::/*). Verify each against host/provider firewall policy." "$WILDCARD_COUNT listener(s) привязаны ко всем локальным адресам (0.0.0.0/::/*). Проверьте каждый с учётом firewall сервера и провайдера."
     else
-        report_result "Wildcard Listeners" "PASS" "No wildcard listening sockets were detected." "Сокеты, слушающие на всех адресах, не обнаружены."
+        report_result "TCP Wildcard Listeners" "PASS" "No wildcard TCP listening sockets were detected." "TCP-сокеты, слушающие на всех адресах, не обнаружены."
+    fi
+
+    report_result "UDP Bound Sockets" "INFO" "$UDP_NETWORK_COUNT network-bound UDP socket(s), including $UDP_WILDCARD_COUNT wildcard socket(s), plus $UDP_LOOPBACK_COUNT loopback-only socket(s). UDP counts can be large for WebRTC/VPN/media port ranges and are reported separately from TCP listeners." "UDP-сокетов на сетевых интерфейсах: $UDP_NETWORK_COUNT, из них на всех адресах: $UDP_WILDCARD_COUNT; только loopback: $UDP_LOOPBACK_COUNT. Для WebRTC/VPN/медиа диапазонов число UDP-сокетов может быть большим, поэтому они учитываются отдельно от TCP listeners."
+
+    if [ "$UDP_NETWORK_COUNT" -gt 0 ]; then
+        append_report_block "Network-bound UDP sockets" "$(summarize_endpoint_ranges udp "${UDP_NETWORK_ENDPOINTS[@]}")"
+    fi
+    if [ "$UDP_LOOPBACK_COUNT" -gt 0 ]; then
+        append_report_block "Loopback-only UDP sockets" "$(summarize_endpoint_ranges udp "${UDP_LOOPBACK_ENDPOINTS[@]}")"
+    fi
+
+    if [ "$UDP_WILDCARD_COUNT" -gt 0 ] && [ "${FIREWALL_ACTIVE:-0}" -ne 1 ]; then
+        report_result "UDP Wildcard Sockets" "WARN" "$UDP_WILDCARD_COUNT UDP socket(s) bind to all local addresses and no restrictive firewall was confirmed." "$UDP_WILDCARD_COUNT UDP-сокет(ов) привязаны ко всем локальным адресам, при этом ограничивающий firewall не подтверждён."
+    elif [ "$UDP_WILDCARD_COUNT" -gt 0 ]; then
+        report_result "UDP Wildcard Sockets" "INFO" "$UDP_WILDCARD_COUNT UDP socket(s) bind to all local addresses. Review intended firewall/NAT exposure, especially large media port ranges." "$UDP_WILDCARD_COUNT UDP-сокет(ов) привязаны ко всем локальным адресам. Проверьте ожидаемую доступность через firewall/NAT, особенно для больших диапазонов медиапортов."
+    else
+        report_result "UDP Wildcard Sockets" "PASS" "No wildcard UDP sockets were detected." "UDP-сокеты, привязанные ко всем адресам, не обнаружены."
     fi
 else
     report_result "Listening Sockets" "WARN" "The ss utility is unavailable; socket exposure could not be inventoried." "Утилита ss недоступна; инвентаризация прослушиваемых сокетов не выполнена."
 fi
 
-# Docker published ports, if Docker is active.
+# Docker host-published ports, if Docker is active. Docker's formatted Ports
+# field also lists container-only EXPOSE metadata; only entries containing `->`
+# are actual host publications and should be treated as host attack surface.
 if command_exists docker && command_exists systemctl && systemctl is-active --quiet docker 2>/dev/null; then
-    DOCKER_PORTS=$(docker ps --format '{{.Names}}\t{{.Ports}}' 2>/dev/null | awk -F'\t' '$2 != "" {print}' || true)
-    if [ -n "$DOCKER_PORTS" ]; then
-        append_report_block "Docker published ports" "$DOCKER_PORTS"
-        DOCKER_WILDCARD=$(printf '%s\n' "$DOCKER_PORTS" | grep -Ec '(^|[ ,])0\.0\.0\.0:|(^|[ ,])\[::\]:' || true)
+    DOCKER_PORT_ROWS=$(docker ps --format '{{.Names}}\t{{.Ports}}' 2>/dev/null | awk -F'\t' '$2 != "" {print}' || true)
+    DOCKER_PUBLISHED=$(printf '%s\n' "$DOCKER_PORT_ROWS" | awk -F'\t' '$2 ~ /->/ {print}' || true)
+
+    if [ -n "$DOCKER_PUBLISHED" ]; then
+        append_report_block "Docker host-published ports" "$DOCKER_PUBLISHED"
+
+        DOCKER_WILDCARD=$(printf '%s\n' "$DOCKER_PUBLISHED" | grep -Ec '(^|[[:space:],])0\.0\.0\.0:|(^|[[:space:],])\[::\]:' || true)
+        DOCKER_LOOPBACK=$(printf '%s\n' "$DOCKER_PUBLISHED" | grep -Ec '(^|[[:space:],])127\.[0-9]+\.[0-9]+\.[0-9]+:|(^|[[:space:],])\[::1\]:' || true)
         DOCKER_WILDCARD=$(safe_count "$DOCKER_WILDCARD")
+        DOCKER_LOOPBACK=$(safe_count "$DOCKER_LOOPBACK")
+
         if [ "$DOCKER_WILDCARD" -gt 0 ]; then
-            report_result "Docker Port Publishing" "WARN" "$DOCKER_WILDCARD running container line(s) include wildcard-published ports. Verify reverse-proxy and firewall intent." "$DOCKER_WILDCARD строк(и) запущенных контейнеров содержат порты, опубликованные на всех адресах. Проверьте настройки reverse proxy и firewall."
+            report_result "Docker Port Publishing" "WARN" "$DOCKER_WILDCARD running container(s) include host ports published on wildcard addresses (0.0.0.0/[::]). Verify that each publication is intentionally reachable beyond localhost." "$DOCKER_WILDCARD запущенных контейнер(а/ов) содержат host-порты, опубликованные на всех адресах (0.0.0.0/[::]). Проверьте, что каждый такой порт действительно должен быть доступен не только через localhost."
+        elif [ "$DOCKER_LOOPBACK" -gt 0 ]; then
+            report_result "Docker Port Publishing" "PASS" "Host-published Docker ports are bound to loopback addresses only in the recognized output." "Распознанные опубликованные Docker-порты привязаны только к loopback-адресам."
         else
-            report_result "Docker Port Publishing" "INFO" "Docker publishes ports, but no 0.0.0.0/[::] wildcard publication was recognized in the formatted output." "Docker публикует порты, но в форматированном выводе не обнаружена публикация на 0.0.0.0/[::]."
+            report_result "Docker Port Publishing" "INFO" "Docker publishes host ports on explicit non-wildcard addresses. Verify that those interface bindings are intentional." "Docker публикует host-порты на явно указанных не-wildcard адресах. Проверьте, что такие привязки к интерфейсам ожидаемы."
+        fi
+
+        # Docker-managed forwarding can occur before the normal UFW INPUT path.
+        # If the classic DOCKER-USER chain exists but has no user rules, do not
+        # assume that `ufw status` alone restricts wildcard-published ports.
+        if command_exists iptables; then
+            DOCKER_USER_RULESET=$(iptables -S DOCKER-USER 2>/dev/null || true)
+            if printf '%s\n' "$DOCKER_USER_RULESET" | grep -q '^-N DOCKER-USER$'; then
+                DOCKER_USER_RULE_COUNT=$(printf '%s\n' "$DOCKER_USER_RULESET" | grep '^-A DOCKER-USER ' | grep -vcE ' -j RETURN$' || true)
+                DOCKER_USER_RULE_COUNT=$(safe_count "$DOCKER_USER_RULE_COUNT")
+                if [ "$DOCKER_WILDCARD" -gt 0 ] && [ "$UFW_ACTIVE" -eq 1 ] && [ "$DOCKER_USER_RULE_COUNT" -eq 0 ]; then
+                    report_result "Docker Firewall Integration" "WARN" "UFW is active and Docker has wildcard-published ports, but DOCKER-USER contains no user filtering rules. Do not assume UFW INPUT rules alone restrict these Docker publications; validate Docker forwarding/firewall policy explicitly." "UFW активен и у Docker есть wildcard-публикации, но в DOCKER-USER нет пользовательских правил фильтрации. Не считайте, что одни правила UFW INPUT гарантированно ограничивают эти Docker-порты; отдельно проверьте forwarding/firewall Docker."
+                elif [ "$DOCKER_USER_RULE_COUNT" -gt 0 ]; then
+                    report_result "Docker Firewall Integration" "INFO" "DOCKER-USER contains $DOCKER_USER_RULE_COUNT user rule(s). Review them together with UFW/nftables and provider firewall policy." "В DOCKER-USER обнаружено пользовательских правил: $DOCKER_USER_RULE_COUNT. Проверьте их совместно с UFW/nftables и firewall провайдера."
+                elif [ "$DOCKER_WILDCARD" -eq 0 ]; then
+                    report_result "Docker Firewall Integration" "PASS" "No wildcard Docker host publication was recognized, so an empty DOCKER-USER chain is not an immediate exposure finding." "Wildcard-публикации Docker на хосте не обнаружены, поэтому пустая цепочка DOCKER-USER сама по себе не является признаком внешней доступности."
+                else
+                    report_result "Docker Firewall Integration" "INFO" "DOCKER-USER exists without user rules. Review Docker forwarding policy if host-published ports should be restricted." "DOCKER-USER существует без пользовательских правил. Проверьте forwarding-политику Docker, если опубликованные host-порты должны быть ограничены."
+                fi
+            else
+                report_result "Docker Firewall Integration" "INFO" "The classic iptables DOCKER-USER chain was not detected. Docker may be using a different firewall backend; validate published-port filtering manually." "Классическая iptables-цепочка DOCKER-USER не обнаружена. Docker может использовать другой backend firewall; фильтрацию опубликованных портов нужно проверить вручную."
+            fi
         fi
     else
-        report_result "Docker Port Publishing" "PASS" "Docker is active and no running container publishes host ports." "Docker активен; ни один запущенный контейнер не публикует порты хоста."
+        report_result "Docker Port Publishing" "PASS" "Docker is active and no running container publishes a host port. Container-only EXPOSE entries are not counted as host publications." "Docker активен; ни один запущенный контейнер не публикует host-порт. Внутренние EXPOSE-порты контейнеров не считаются публикацией на хосте."
     fi
 fi
 
@@ -851,16 +986,28 @@ else
     report_result "Password Policy" "WARN" "No explicit pwquality minimum length was found while SSH password authentication is not confirmed disabled. Review PAM/password policy." "Явная минимальная длина pwquality не найдена, а отключение парольной аутентификации SSH не подтверждено. Проверьте PAM и политику паролей."
 fi
 
-# SUID files: stay on the root filesystem (-xdev) and flag files not owned by a
-# Debian package rather than blindly trusting all binaries in standard paths.
+# SUID files: stay on the host root filesystem and prune common container/image
+# storage. Files inside Docker/containerd/Snap image stores are not host executables
+# and otherwise create large false-positive sets when checked with host dpkg-query.
 if command_exists find; then
-    mapfile -t SUID_FILES < <(find / -xdev -type f -perm -4000 -print 2>/dev/null)
+    mapfile -t SUID_FILES < <(
+        find / -xdev \
+            \( -path /var/lib/docker -o -path '/var/lib/docker/*' \
+               -o -path /var/lib/containerd -o -path '/var/lib/containerd/*' \
+               -o -path /var/lib/containers -o -path '/var/lib/containers/*' \
+               -o -path /var/lib/lxc -o -path '/var/lib/lxc/*' \
+               -o -path /var/lib/snapd -o -path '/var/lib/snapd/*' \
+               -o -path /snap -o -path '/snap/*' \) -prune -o \
+            -type f -perm -4000 -print 2>/dev/null
+    )
     SUID_TOTAL=${#SUID_FILES[@]}
     SUID_UNOWNED=()
 
     if command_exists dpkg-query; then
         for suid_file in "${SUID_FILES[@]}"; do
-            if ! dpkg-query -S "$suid_file" >/dev/null 2>&1; then
+            suid_real=$(readlink -f "$suid_file" 2>/dev/null || printf '%s' "$suid_file")
+            if ! dpkg-query -S "$suid_file" >/dev/null 2>&1 && \
+               ! dpkg-query -S "$suid_real" >/dev/null 2>&1; then
                 SUID_UNOWNED+=("$suid_file")
             fi
         done
