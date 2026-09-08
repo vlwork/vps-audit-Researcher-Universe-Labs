@@ -156,3 +156,11 @@ bash -n vps-audit.sh
 - лицензия: MIT
 
 Эта версия является модифицированным вариантом исходного проекта. Copyright notice и текст MIT License сохранены в файле [`LICENSE`](LICENSE).
+
+## Support / Поддержать проект
+
+If this project is useful to you, you can support its development.
+
+Если проект оказался полезен, вы можете поддержать его развитие.
+
+[Support via CloudTips / Поддержать через CloudTips](https://pay.cloudtips.ru/p/23e2873b)
